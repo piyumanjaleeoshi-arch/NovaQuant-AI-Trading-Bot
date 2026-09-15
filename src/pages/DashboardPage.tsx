@@ -25,6 +25,7 @@ import {
   TradeDirection,
   BotStatus
 } from '../types';
+import { CapitalManagementCard } from '../components/CapitalManagementCard';
 
 interface DashboardPageProps {
   analytics: AnalyticsPerformance | null;
@@ -220,6 +221,9 @@ export const DashboardPage: React.FC<DashboardPageProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Production Exchange Balance & Capital Sync Cockpit */}
+      <CapitalManagementCard onNavigateTab={onNavigateTab} />
 
       {/* Metric Cards Grid */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">

@@ -9,8 +9,78 @@ import {
   AnalyticsPerformance,
   RiskSettings,
   TradeDirection,
-  AIEngineDecision
+  AIEngineDecision,
+  UserProfile,
+  ConnectionTestResult
 } from '../types';
+
+let currentAuthToken: string | null = null;
+let currentUserId: string = 'usr_piyumanjalee';
+
+export function setAuthSession(token: string | null, userId?: string) {
+  currentAuthToken = token;
+  if (userId) currentUserId = userId;
+  try {
+    if (userId) localStorage.setItem('novaquant_active_user_id', userId);
+    if (token) localStorage.setItem('novaquant_auth_token', token);
+  } catch {
+    // ignore
+  }
+}
+
+export function getAuthHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {};
+  try {
+    if (!currentAuthToken) {
+      currentAuthToken = localStorage.getItem('novaquant_auth_token');
+    }
+    if (!currentUserId) {
+      currentUserId = localStorage.getItem('novaquant_active_user_id') || 'usr_piyumanjalee';
+    }
+  } catch {
+    // ignore
+  }
+  if (currentAuthToken) {
+    headers['Authorization'] = `Bearer ${currentAuthToken}`;
+  }
+  if (currentUserId) {
+    headers['x-user-id'] = currentUserId;
+  }
+  return headers;
+}
+
+export async function fetchCurrentUser(): Promise<{
+  user: UserProfile;
+  token: string;
+  availableUsers: UserProfile[];
+}> {
+  const res = await fetch('/api/auth/me', {
+    headers: { ...getAuthHeaders() },
+  });
+  if (!res.ok) throw new Error('Failed to fetch user profile');
+  const data = await res.json();
+  if (data.token) {
+    setAuthSession(data.token, data.user?.id);
+  }
+  return data;
+}
+
+export async function switchUser(userId: string): Promise<{
+  success: boolean;
+  user: UserProfile;
+  token: string;
+  message: string;
+}> {
+  const res = await fetch('/api/auth/switch', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+    body: JSON.stringify({ userId }),
+  });
+  if (!res.ok) throw new Error('Failed to switch user');
+  const data = await res.json();
+  setAuthSession(data.token, data.user?.id);
+  return data;
+}
 
 export async function fetchMarketData(symbol: string): Promise<MarketData> {
   const res = await fetch(`/api/market-data/${encodeURIComponent(symbol)}`);
@@ -244,9 +314,29 @@ export async function updateBotStatus(
 }
 
 export async function fetchExchangeConnections(): Promise<import('../types').ExchangeConnectionsResponse> {
-  const res = await fetch('/api/exchanges/connections');
+  const res = await fetch('/api/exchanges/connections', {
+    headers: { ...getAuthHeaders() },
+  });
   if (!res.ok) throw new Error('Failed to fetch exchange connections');
   return res.json();
+}
+
+export async function testExchangeConnection(payload: {
+  exchange: import('../types').SupportedExchange;
+  apiKey: string;
+  secretKey: string;
+  passphrase?: string;
+}): Promise<ConnectionTestResult> {
+  const res = await fetch('/api/exchanges/test-connection', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error || 'Connection test failed');
+  }
+  return data;
 }
 
 export async function connectExchange(payload: {
@@ -262,12 +352,13 @@ export async function connectExchange(payload: {
   exchange: string;
   status: string;
   pingMs: number;
+  permissions?: { read: boolean; trade: boolean; withdrawal: boolean };
   balance?: import('../types').ExchangeAccountBalance;
   botCapital?: number;
 }> {
   const res = await fetch('/api/exchanges/connect', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
     body: JSON.stringify(payload),
   });
   if (!res.ok) {
@@ -280,7 +371,7 @@ export async function connectExchange(payload: {
 export async function disconnectExchange(exchange: import('../types').SupportedExchange): Promise<{ success: boolean; message: string }> {
   const res = await fetch('/api/exchanges/disconnect', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
     body: JSON.stringify({ exchange }),
   });
   if (!res.ok) throw new Error('Failed to disconnect exchange');
@@ -301,7 +392,9 @@ export async function fetchExchangeBalances(): Promise<import('../types').AllExc
   };
 
   try {
-    const res = await fetch('/api/exchanges/balances');
+    const res = await fetch('/api/exchanges/balances', {
+      headers: { ...getAuthHeaders() },
+    });
     if (res.ok) {
       return await res.json();
     }
@@ -309,7 +402,9 @@ export async function fetchExchangeBalances(): Promise<import('../types').AllExc
     // Retry once after 600ms if server is warming up or temporarily restarting
     try {
       await new Promise((resolve) => setTimeout(resolve, 600));
-      const retryRes = await fetch('/api/exchanges/balances');
+      const retryRes = await fetch('/api/exchanges/balances', {
+        headers: { ...getAuthHeaders() },
+      });
       if (retryRes.ok) {
         return await retryRes.json();
       }
@@ -330,7 +425,7 @@ export async function refreshExchangeBalances(exchange?: import('../types').Supp
 }> {
   const res = await fetch('/api/exchanges/balances/refresh', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
     body: JSON.stringify({ exchange }),
   });
   if (!res.ok) {
@@ -346,10 +441,172 @@ export async function selectExchangeTradingMarket(
 ): Promise<{ success: boolean; activeTradingMarket: 'SPOT' | 'FUTURES'; balance: import('../types').ExchangeAccountBalance }> {
   const res = await fetch('/api/exchanges/balances/select-market', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
     body: JSON.stringify({ exchange, market }),
   });
   if (!res.ok) throw new Error('Failed to select trading market');
   return res.json();
 }
+
+
+// ---------------------------------------------------------------------------------
+// CAPITAL MANAGER CLIENT API
+// ---------------------------------------------------------------------------------
+
+const DEFAULT_CAPITAL_FALLBACK: import('../types').CapitalOverviewResponse = {
+  totalConnectedCapital: 0,
+  totalAvailableTradingCapital: 0,
+  activeStrategyExchange: 'Binance',
+  exchanges: {
+    Binance: {
+      exchange: 'Binance',
+      connected: false,
+      exchangeBalance: 0,
+      availableBalance: 0,
+      allocatedCapital: 0,
+      usedCapital: 0,
+      availableTradingCapital: 0,
+      unrealizedPnL: 0,
+      realizedPnL: 0,
+      lastSyncTime: 0,
+      capitalMode: 'AUTO_SYNC',
+      configuredAllocation: 0,
+      syncStatus: 'PENDING',
+      syncError: null,
+      isLiveTradingEnabled: false,
+      permissions: { read: true, spotTrading: true, futuresTrading: true, withdrawals: false },
+    },
+    Bybit: {
+      exchange: 'Bybit',
+      connected: false,
+      exchangeBalance: 0,
+      availableBalance: 0,
+      allocatedCapital: 0,
+      usedCapital: 0,
+      availableTradingCapital: 0,
+      unrealizedPnL: 0,
+      realizedPnL: 0,
+      lastSyncTime: 0,
+      capitalMode: 'AUTO_SYNC',
+      configuredAllocation: 0,
+      syncStatus: 'PENDING',
+      syncError: null,
+      isLiveTradingEnabled: false,
+      permissions: { read: true, spotTrading: true, futuresTrading: true, withdrawals: false },
+    },
+    Bitget: {
+      exchange: 'Bitget',
+      connected: false,
+      exchangeBalance: 0,
+      availableBalance: 0,
+      allocatedCapital: 0,
+      usedCapital: 0,
+      availableTradingCapital: 0,
+      unrealizedPnL: 0,
+      realizedPnL: 0,
+      lastSyncTime: 0,
+      capitalMode: 'AUTO_SYNC',
+      configuredAllocation: 0,
+      syncStatus: 'PENDING',
+      syncError: null,
+      isLiveTradingEnabled: false,
+      permissions: { read: true, spotTrading: true, futuresTrading: true, withdrawals: false },
+    },
+  },
+  liveReadiness: {
+    isReady: false,
+    checks: {
+      exchangeConnected: false,
+      balanceSuccessfullySynced: false,
+      tradingPermissionEnabled: true,
+      riskLimitsConfigured: true,
+      userExplicitlyEnabledLiveTrading: false,
+    },
+    missingRequirements: ['Connect exchange API credentials to enable live balance.'],
+  },
+  syncedAt: Date.now(),
+};
+
+export async function fetchCapitalOverview(): Promise<import('../types').CapitalOverviewResponse> {
+  const maxRetries = 3;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const res = await fetch('/api/capital/overview', {
+        headers: { ...getAuthHeaders() },
+      });
+      if (res.ok) {
+        return await res.json();
+      }
+    } catch {
+      // Allow retry on transient network glitch or cold start
+    }
+    if (attempt < maxRetries - 1) {
+      await new Promise((resolve) => setTimeout(resolve, 400 * (attempt + 1)));
+    }
+  }
+  return DEFAULT_CAPITAL_FALLBACK;
+}
+
+export async function syncCapital(exchange?: import('../types').SupportedExchange): Promise<import('../types').CapitalOverviewResponse> {
+  const res = await fetch('/api/capital/sync', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+    body: JSON.stringify({ exchange }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || 'Failed to sync exchange capital');
+  }
+  return res.json();
+}
+
+export async function updateCapitalMode(payload: {
+  exchange?: import('../types').SupportedExchange;
+  capitalMode: import('../types').CapitalMode;
+  configuredAllocation?: number;
+}): Promise<import('../types').CapitalOverviewResponse> {
+  const res = await fetch('/api/capital/mode', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || 'Failed to update capital mode');
+  }
+  return res.json();
+}
+
+export async function selectStrategyExchange(
+  exchange: import('../types').SupportedExchange
+): Promise<import('../types').CapitalOverviewResponse> {
+  const res = await fetch('/api/capital/select-exchange', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+    body: JSON.stringify({ exchange }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || 'Failed to select strategy exchange');
+  }
+  return res.json();
+}
+
+export async function setLiveTradingStatus(payload: {
+  exchange: import('../types').SupportedExchange;
+  enabled: boolean;
+}): Promise<import('../types').CapitalOverviewResponse> {
+  const res = await fetch('/api/capital/live-trading', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || 'Failed to set live trading status');
+  }
+  return res.json();
+}
+
+
 

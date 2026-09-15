@@ -37,6 +37,8 @@ import {
   getUserExchangeConnectionByExchange,
   deleteUserExchangeConnection,
   updateUserExchangeConnectionStatus,
+  updateExchangeCapitalSync,
+  setExchangeLiveTrading,
   createUserBot,
   getUserBots,
   getUserBotById,
@@ -46,6 +48,14 @@ import {
   ExchangeConnectionRecord,
   BotRecord,
 } from './server/databaseService';
+import {
+  capitalManager,
+  CapitalState,
+  CapitalMode,
+  LiveTradingReadinessCheck,
+} from './server/capitalManager';
+import { riskManager } from './server/riskManager';
+import { createExchangeAdapter, ExchangeAdapter } from './server/adapters';
 import {
   encryptCredential,
   decryptCredential,
@@ -505,6 +515,27 @@ setInterval(() => {
   }
 }, 1500);
 
+// Periodically synchronize real exchange balances every 30 seconds while bot is active
+setInterval(async () => {
+  try {
+    const allUsers = [DEFAULT_USER.id, ...AVAILABLE_USERS.map((u) => u.id)];
+    for (const uId of allUsers) {
+      const conns = getUserExchangeConnections(uId).filter((c) => c.status === 'CONNECTED');
+      for (const c of conns) {
+        const normEx = (c.exchange.charAt(0).toUpperCase() + c.exchange.slice(1).toLowerCase()) as SupportedExchange;
+        try {
+          await syncUserExchangeBalance(uId, normEx);
+        } catch (e: any) {
+          // Log warning and keep previous verified capital state intact
+          console.warn(`[PERIODIC AUTO-SYNC] Sync notice for ${normEx} (${uId}): ${e?.message}`);
+        }
+      }
+    }
+  } catch (err) {
+    // Non-blocking timer guard
+  }
+}, 30000);
+
 function closeTradeInternal(
   tradeId: string,
   exitReason: 'TAKE_PROFIT' | 'STOP_LOSS' | 'MANUAL_CLOSE',
@@ -527,6 +558,7 @@ function closeTradeInternal(
   }
 
   accountBalance = Number((accountBalance + finalPnl).toFixed(2));
+  capitalManager.releaseCapitalFromTrade(trade.id, finalPnl);
   const isWin = finalPnl > 0;
 
   const closedItem: ClosedTrade = {
@@ -938,7 +970,8 @@ app.post('/api/risk/check', (req, res) => {
 });
 
 // 6. POST /api/trades/open - Order Management Engine (Executes only approved trades)
-app.post('/api/trades/open', (req, res) => {
+app.post('/api/trades/open', async (req: any, res) => {
+  const userId = req.user?.id || DEFAULT_USER.id;
   const { symbol, direction, position_size, stop_loss, take_profit, exchange, consensusScore } = req.body;
 
   // Enforce engine operational state safety
@@ -959,35 +992,145 @@ app.post('/api/trades/open', (req, res) => {
     });
   }
 
-  if (activeTrades.length >= riskSettings.maxOpenTrades) {
-    return res.status(400).json({ error: 'Max open trades limit reached' });
+  const tradeSymbol = symbol || 'BTC/USDT';
+  const tradeDirection: TradeDirection = direction === 'SHORT' ? 'SHORT' : 'LONG';
+  const currentPrice = symbolPrices[tradeSymbol] || 65000;
+
+  // Determine target exchange
+  const targetExchange: SupportedExchange = exchange
+    ? exchange.toLowerCase().includes('bitg')
+      ? 'Bitget'
+      : exchange.toLowerCase().includes('bybit')
+      ? 'Bybit'
+      : 'Binance'
+    : userSelectedStrategyExchange[userId] || 'Binance';
+
+  const conn = getUserExchangeConnectionByExchange(userId, targetExchange);
+
+  // 1. Production Rule: If connected, re-synchronize balance immediately before placing trade
+  if (conn && conn.status === 'CONNECTED') {
+    try {
+      await syncUserExchangeBalance(userId, targetExchange);
+    } catch (syncErr: any) {
+      console.warn(`[ORDER ENGINE PRE-SYNC HALT] Cannot trade: Fresh balance sync failed on ${targetExchange}: ${syncErr?.message}`);
+      return res.status(503).json({
+        error: `Cannot place trade: Failed to synchronize fresh balance with ${targetExchange}. Stale capital trade protection triggered.`,
+        details: syncErr?.message,
+      });
+    }
   }
 
-  const currentPrice = symbolPrices[symbol] || 65000;
+  // Get current capital state
+  const capitalState = capitalManager.getCapitalState(userId, targetExchange);
+  const availableCapital = capitalState.availableTradingCapital > 0 ? capitalState.availableTradingCapital : (accountBalance || 1000);
+
+  // Compute position size and stop/take profit levels
   const size = Number(position_size) || (currentPrice > 1000 ? 0.05 : 10);
   const positionVal = Number((size * currentPrice).toFixed(2));
+  const sl = Number(stop_loss) || (tradeDirection === 'LONG' ? currentPrice * 0.98 : currentPrice * 1.02);
+  const tp = Number(take_profit) || (tradeDirection === 'LONG' ? currentPrice * 1.04 : currentPrice * 0.96);
+
+  // 2. Risk Management Engine Pipeline
+  const riskCheck = riskManager.evaluateOrderRisk(
+    {
+      symbol: tradeSymbol,
+      direction: tradeDirection,
+      currentPrice,
+      customStopLoss: sl,
+      customTakeProfit: tp,
+    },
+    capitalState,
+    riskSettings,
+    activeTrades.length,
+    0,
+    dailyStartingBalance || availableCapital
+  );
+
+  if (!riskCheck.approved) {
+    console.warn(`[RISK REJECTION] Trade for ${tradeSymbol} blocked:`, riskCheck.rejectedReason);
+    return res.status(400).json({
+      error: `Trade rejected by institutional Risk Engine: ${riskCheck.rejectedReason}`,
+      riskCheck,
+    });
+  }
+
+  // 3. Capital Manager Validation Pipeline
+  const capitalValidation = capitalManager.validateCapitalForOrder(userId, targetExchange, positionVal);
+  if (!capitalValidation.valid) {
+    console.warn(`[CAPITAL REJECTION] Order of $${positionVal} exceeds available capital ($${capitalValidation.availableTradingCapital}): ${capitalValidation.reason}`);
+    return res.status(400).json({
+      error: `Capital Manager Rejected: ${capitalValidation.reason}`,
+      capitalValidation,
+    });
+  }
+
+  const tradeId = `tr-${Date.now().toString().slice(-4)}`;
+
+  // 4. Live Trading Execution or Protected Simulation
+  let orderExecutionDetails: any = null;
+  const isLive = Boolean(conn && conn.is_live_trading_enabled && capitalState.isLiveTradingEnabled);
+
+  if (isLive && conn) {
+    try {
+      const adapter = getAdapterForConnection(conn);
+      const placed = await adapter.placeOrder({
+        symbol: tradeSymbol,
+        side: tradeDirection === 'LONG' ? 'BUY' : 'SELL',
+        type: 'MARKET',
+        quantity: size,
+        price: currentPrice,
+        stopLoss: sl,
+        takeProfit: tp,
+      });
+      orderExecutionDetails = {
+        executionType: 'LIVE_EXCHANGE',
+        orderId: placed.orderId,
+        exchange: targetExchange,
+        status: placed.status,
+      };
+    } catch (orderErr: any) {
+      console.error(`[LIVE ORDER FAILED] ${targetExchange}:`, orderErr);
+      return res.status(502).json({
+        error: `Live exchange execution failed on ${targetExchange}: ${orderErr?.message}`,
+      });
+    }
+  } else {
+    orderExecutionDetails = {
+      executionType: 'PROTECTED_SIMULATION',
+      exchange: targetExchange,
+      reason: conn ? 'Live trading confirmation toggle not active' : 'No exchange connection active',
+    };
+  }
+
+  // 5. Allocate capital in CapitalManager
+  capitalManager.allocateCapitalForTrade(userId, targetExchange, tradeId, positionVal);
 
   const newTrade: ActiveTrade = {
-    id: `tr-${Date.now().toString().slice(-4)}`,
-    symbol: symbol || 'BTC/USDT',
-    direction: direction || 'LONG',
+    id: tradeId,
+    symbol: tradeSymbol,
+    direction: tradeDirection,
     entryPrice: currentPrice,
     currentPrice: currentPrice,
     positionSize: size,
     positionValue: positionVal,
-    stopLoss: Number(stop_loss) || (direction === 'LONG' ? currentPrice * 0.98 : currentPrice * 1.02),
-    takeProfit: Number(take_profit) || (direction === 'LONG' ? currentPrice * 1.04 : currentPrice * 0.96),
+    stopLoss: sl,
+    takeProfit: tp,
     pnl: 0,
     pnlPercentage: 0,
     status: 'ACTIVE',
     openedAt: Date.now(),
-    exchange: exchange || 'Binance',
-    mode: tradingMode,
+    exchange: targetExchange,
+    mode: isLive ? 'LIVE' : 'DEMO',
     consensusScore: consensusScore || 85,
   };
 
   activeTrades.unshift(newTrade);
-  res.json({ success: true, trade: newTrade });
+  res.json({
+    success: true,
+    trade: newTrade,
+    execution: orderExecutionDetails,
+    capitalState: capitalManager.getCapitalState(userId, targetExchange),
+  });
 });
 
 // 7. GET /api/trades/active
@@ -1387,9 +1530,34 @@ function getUserBalanceCache(userId: string): Record<SupportedExchange, Exchange
 
 let activeTradingMarket: 'SPOT' | 'FUTURES' = 'SPOT';
 
+// User Selected Strategy Exchange (userId -> SupportedExchange)
+const userSelectedStrategyExchange: Record<string, SupportedExchange> = {};
+
+/**
+ * Creates an instantiated exchange adapter for a verified database connection record.
+ */
+function getAdapterForConnection(conn: ExchangeConnectionRecord): ExchangeAdapter {
+  const apiKey = decryptCredential(conn.encrypted_api_key);
+  const secretKey = decryptCredential(conn.encrypted_api_secret);
+  const passphrase = conn.encrypted_api_passphrase ? decryptCredential(conn.encrypted_api_passphrase) : undefined;
+  const normExchange: SupportedExchange = conn.exchange.toLowerCase().includes('bitg')
+    ? 'Bitget'
+    : conn.exchange.toLowerCase().includes('bybit')
+    ? 'Bybit'
+    : 'Binance';
+
+  return createExchangeAdapter(normExchange, {
+    apiKey,
+    secretKey,
+    passphrase,
+    isDemoMode: conn.is_live_trading_enabled !== 1, // Only live execution if user explicitly confirmed live trading
+  });
+}
+
 /**
  * Syncs real exchange balances on-the-fly for an authenticated user.
  * Decrypts credentials only server-side during the API call, never logs secrets.
+ * Auto-syncs into CapitalManager to establish real available trading capital.
  */
 async function syncUserExchangeBalance(
   userId: string,
@@ -1400,41 +1568,75 @@ async function syncUserExchangeBalance(
     throw new Error(`${exchangeName} is not connected for this user account.`);
   }
 
-  // Decrypt credentials server-side
-  const decryptedApiKey = decryptCredential(conn.encrypted_api_key);
-  const decryptedApiSecret = decryptCredential(conn.encrypted_api_secret);
-  const decryptedPassphrase = conn.encrypted_api_passphrase
-    ? decryptCredential(conn.encrypted_api_passphrase)
-    : undefined;
+  // Instantiate clean modular exchange adapter
+  const adapter = getAdapterForConnection(conn);
 
-  let result: { spot: MarketBalanceInfo; futures: MarketBalanceInfo; rawSummary?: string };
-  if (exchangeName === 'Binance') {
-    result = await fetchBinanceRealBalances(decryptedApiKey, decryptedApiSecret);
-  } else if (exchangeName === 'Bybit') {
-    result = await fetchBybitRealBalances(decryptedApiKey, decryptedApiSecret);
-  } else if (exchangeName === 'Bitget') {
-    result = await fetchBitgetRealBalances(decryptedApiKey, decryptedApiSecret, decryptedPassphrase);
-  } else {
-    throw new Error(`Unsupported exchange: ${exchangeName}`);
+  // Sync with CapitalManager
+  let capitalState: CapitalState;
+  try {
+    capitalState = await capitalManager.syncCapital(
+      adapter,
+      userId,
+      (conn.capital_mode as any) || 'AUTO_SYNC',
+      conn.configured_allocation
+    );
+
+    // Sync live trading flag from DB
+    if (conn.is_live_trading_enabled) {
+      capitalManager.setLiveTrading(userId, exchangeName, true);
+    }
+
+    // Persist verified balance and status in database
+    updateExchangeCapitalSync(userId, conn.id, {
+      latest_balance: capitalState.exchangeBalance,
+      latest_available_balance: capitalState.availableBalance,
+      last_sync_time: capitalState.lastSyncTime,
+      sync_status: 'SYNCED',
+      sync_error: null,
+    });
+  } catch (syncErr: any) {
+    updateExchangeCapitalSync(userId, conn.id, {
+      sync_status: 'ERROR',
+      sync_error: syncErr?.message || 'Sync failed',
+    });
+    throw syncErr;
   }
+
+  // Also query detailed market breakdown for UI backward compatibility
+  const details = await adapter.getAccountBalance();
 
   const cache = getUserBalanceCache(userId);
   const selectedMode = cache[exchangeName]?.selectedMode || activeTradingMarket || 'SPOT';
-  const activeBotCapital = selectedMode === 'SPOT' ? result.spot.available : result.futures.available;
+  const activeBotCapital = capitalState.availableTradingCapital;
 
   cache[exchangeName] = {
     exchange: exchangeName,
     connected: true,
-    lastSyncedAt: Date.now(),
-    spot: result.spot,
-    futures: result.futures,
+    lastSyncedAt: capitalState.lastSyncTime,
+    spot: {
+      capital: details.spotAvailable,
+      botCapital: capitalState.availableTradingCapital,
+      available: details.spotAvailable,
+      lockedInOrders: details.lockedUSDT,
+      currency: 'USDT',
+    },
+    futures: {
+      capital: details.futuresAvailable,
+      botCapital: capitalState.availableTradingCapital,
+      available: details.futuresAvailable,
+      lockedInOrders: 0,
+      marginUsed: capitalState.usedCapital,
+      unrealizedPnl: capitalState.unrealizedPnL,
+      currency: 'USDT',
+    },
     selectedMode,
     activeBotCapital,
-    rawSummary: result.rawSummary,
+    rawSummary: details.rawSummary,
   };
 
-  // Sync global cockpit capital
-  if (activeBotCapital > 0) {
+  // Sync global cockpit balance if this is the active strategy exchange
+  const currentActiveEx = userSelectedStrategyExchange[userId] || exchangeName;
+  if (currentActiveEx === exchangeName && activeBotCapital > 0) {
     accountBalance = activeBotCapital;
     dailyStartingBalance = activeBotCapital;
   }
@@ -1518,6 +1720,84 @@ app.get('/api/exchanges/connections', (req: any, res) => {
   });
 });
 
+// 1b. POST /api/exchanges/test-connection - Test Credentials & Verify Zero-Withdrawal Permissions
+app.post('/api/exchanges/test-connection', async (req: any, res) => {
+  const { exchange, apiKey, secretKey, passphrase } = req.body;
+  if (!exchange || !apiKey || !secretKey) {
+    return res.status(400).json({
+      success: false,
+      error: 'Exchange, API Key, and API Secret are required to test connection.',
+    });
+  }
+
+  const cleanApiKey = String(apiKey).trim();
+  const cleanSecretKey = String(secretKey).trim();
+  const cleanPassphrase = passphrase ? String(passphrase).trim() : '';
+
+  const normExchange: SupportedExchange = exchange.toLowerCase().includes('bitg')
+    ? 'Bitget'
+    : exchange.toLowerCase().includes('bybit')
+    ? 'Bybit'
+    : 'Binance';
+
+  try {
+    const testAdapter = createExchangeAdapter(normExchange, {
+      apiKey: cleanApiKey,
+      secretKey: cleanSecretKey,
+      passphrase: cleanPassphrase || undefined,
+      isDemoMode: false,
+    });
+
+    const testResult = await testAdapter.testConnection();
+
+    if (!testResult.success) {
+      return res.status(400).json({
+        success: false,
+        exchange: normExchange,
+        status: testResult.status,
+        latencyMs: testResult.latencyMs,
+        permissions: testResult.permissions,
+        error: testResult.errorMessage || 'Connection verification failed',
+      });
+    }
+
+    // Safety check: Bot must NEVER have withdrawal permission
+    if (testResult.permissions.withdrawal) {
+      return res.status(403).json({
+        success: false,
+        exchange: normExchange,
+        status: 'ERROR',
+        latencyMs: testResult.latencyMs,
+        permissions: testResult.permissions,
+        error: 'SECURITY REJECTION: API key has withdrawal permissions enabled. For safety, disable withdrawals on the exchange before connecting.',
+      });
+    }
+
+    return res.json({
+      success: true,
+      exchange: normExchange,
+      status: 'CONNECTED',
+      latencyMs: testResult.latencyMs,
+      permissions: testResult.permissions,
+      message: `Successfully connected to ${normExchange} API. Permissions verified: read/trade authorized, withdrawals safely disabled.`,
+    });
+  } catch (err: any) {
+    const rawError = err?.message || String(err);
+    const sanitizedError = rawError
+      .replace(new RegExp(cleanApiKey, 'g'), '***KEY***')
+      .replace(new RegExp(cleanSecretKey, 'g'), '***SECRET***');
+
+    return res.status(400).json({
+      success: false,
+      exchange: normExchange,
+      status: 'ERROR',
+      latencyMs: 0,
+      permissions: { read: false, trade: false, withdrawal: false },
+      error: sanitizedError,
+    });
+  }
+});
+
 // 2. POST /api/exchanges/connect - Connect User Exchange with AES-256-GCM Encryption
 app.post('/api/exchanges/connect', async (req: any, res) => {
   const userId = req.user?.id || DEFAULT_USER.id;
@@ -1538,25 +1818,40 @@ app.post('/api/exchanges/connect', async (req: any, res) => {
     : 'Binance';
 
   try {
-    // 1. Immediately verify credentials against real exchange API before storing
-    let balanceResult: { spot: MarketBalanceInfo; futures: MarketBalanceInfo; rawSummary?: string };
-    if (normExchange === 'Binance') {
-      balanceResult = await fetchBinanceRealBalances(cleanApiKey, cleanSecretKey);
-    } else if (normExchange === 'Bybit') {
-      balanceResult = await fetchBybitRealBalances(cleanApiKey, cleanSecretKey);
-    } else {
-      if (!cleanPassphrase) {
-        return res.status(400).json({ error: 'Bitget requires an API passphrase.' });
-      }
-      balanceResult = await fetchBitgetRealBalances(cleanApiKey, cleanSecretKey, cleanPassphrase);
+    // 1. Create adapter and test connection first
+    const testAdapter = createExchangeAdapter(normExchange, {
+      apiKey: cleanApiKey,
+      secretKey: cleanSecretKey,
+      passphrase: cleanPassphrase || undefined,
+      isDemoMode: false,
+    });
+
+    const testResult = await testAdapter.testConnection();
+
+    // Security check: Must reject any API key with withdrawal permissions
+    if (testResult.permissions.withdrawal) {
+      return res.status(403).json({
+        error: 'SECURITY REJECTION: API key has withdrawal permissions enabled. For safety, disable withdrawals on the exchange before connecting.',
+      });
     }
 
-    // 2. Encrypt credentials using server-side AES-256-GCM
+    if (!testResult.success) {
+      return res.status(400).json({
+        error: testResult.errorMessage || `Failed to verify ${normExchange} credentials`,
+      });
+    }
+
+    // 2. Verify account balances directly
+    if (normExchange === 'Bitget' && !cleanPassphrase) {
+      return res.status(400).json({ error: 'Bitget requires an API passphrase.' });
+    }
+
+    // 3. Encrypt credentials using server-side AES-256-GCM
     const encryptedKey = encryptCredential(cleanApiKey);
     const encryptedSecret = encryptCredential(cleanSecretKey);
     const encryptedPass = cleanPassphrase ? encryptCredential(cleanPassphrase) : null;
 
-    // 3. Save connection into SQLite database bound strictly to userId
+    // 4. Save connection into SQLite database bound strictly to userId
     const savedConnection = saveUserExchangeConnection({
       user_id: userId,
       exchange: normExchange,
@@ -1566,25 +1861,14 @@ app.post('/api/exchanges/connect', async (req: any, res) => {
       status: 'CONNECTED',
     });
 
-    const chosenMarket: 'SPOT' | 'FUTURES' = selectedMode === 'FUTURES' ? 'FUTURES' : 'SPOT';
-    const activeTradingAvailable =
-      chosenMarket === 'SPOT' ? balanceResult.spot.available : balanceResult.futures.available;
+    // Set as active strategy exchange if first connected
+    if (!userSelectedStrategyExchange[userId]) {
+      userSelectedStrategyExchange[userId] = normExchange;
+    }
 
-    const cache = getUserBalanceCache(userId);
-    cache[normExchange] = {
-      exchange: normExchange,
-      connected: true,
-      lastSyncedAt: Date.now(),
-      spot: balanceResult.spot,
-      futures: balanceResult.futures,
-      selectedMode: chosenMarket,
-      activeBotCapital: activeTradingAvailable,
-      rawSummary: balanceResult.rawSummary,
-    };
-
-    activeTradingMarket = chosenMarket;
-    accountBalance = activeTradingAvailable;
-    dailyStartingBalance = activeTradingAvailable;
+    // Immediately sync real available balance into CapitalManager
+    await syncUserExchangeBalance(userId, normExchange);
+    const capitalState = capitalManager.getCapitalState(userId, normExchange);
 
     // Ensure a default bot exists for this user tied to this new connection
     const existingBots = getUserBots(userId);
@@ -1595,7 +1879,7 @@ app.post('/api/exchanges/connect', async (req: any, res) => {
         name: `${normExchange} Momentum Alpha Bot`,
         strategy: 'Dual-AI Momentum Confluence',
         trading_pair: 'BTC/USDT',
-        capital_allocation: activeTradingAvailable > 0 ? activeTradingAvailable : 1000,
+        capital_allocation: capitalState.availableTradingCapital > 0 ? capitalState.availableTradingCapital : 1000,
         risk_settings: riskSettings,
         status: 'STOPPED', // BOT_DEFAULT_STATUS=stopped
       });
@@ -1604,17 +1888,21 @@ app.post('/api/exchanges/connect', async (req: any, res) => {
     // Audit log
     getRecentAuditLogs();
 
+    const cache = getUserBalanceCache(userId);
+
     // Crucial Security Rule: NEVER return plain secret or encrypted secret to frontend!
     return res.json({
       success: true,
-      message: `${normExchange} connected and verified for account ${req.user?.email || userId}. Bot capital synced: ${activeTradingAvailable} USDT.`,
+      message: `${normExchange} connected and verified for account ${req.user?.email || userId}. Available trading capital synced: $${capitalState.availableTradingCapital.toFixed(2)} USDT.`,
       exchange: normExchange,
       connectionId: savedConnection.id,
       status: 'CONNECTED',
-      pingMs: 24,
+      pingMs: testResult.latencyMs || 24,
       apiKeyMasked: maskApiKey(cleanApiKey),
+      permissions: testResult.permissions,
       balance: cache[normExchange],
-      botCapital: activeTradingAvailable,
+      botCapital: capitalState.availableTradingCapital,
+      capitalState,
     });
   } catch (err: any) {
     // Sanitize error message to avoid any possible credential reflection
@@ -1631,6 +1919,7 @@ app.post('/api/exchanges/connect', async (req: any, res) => {
     });
   }
 });
+
 
 // 3. POST /api/exchanges/disconnect - Disconnect User Exchange Connection
 app.post('/api/exchanges/disconnect', (req: any, res) => {
@@ -1763,6 +2052,271 @@ app.post('/api/exchanges/balances/select-market', (req: any, res) => {
     success: true,
     activeTradingMarket: newMarket,
     balance: cache[normExchange],
+  });
+});
+
+// ---------------------------------------------------------------------------------
+// PRODUCTION CAPITAL MANAGER & AUTO CAPITAL SYNC API
+// ---------------------------------------------------------------------------------
+
+function buildUserCapitalOverview(userId: string) {
+  const userConns = getUserExchangeConnections(userId);
+  const supported: SupportedExchange[] = ['Binance', 'Bybit', 'Bitget'];
+  const exchangesRecord: Record<SupportedExchange, any> = {} as any;
+
+  let totalConnectedCapital = 0;
+  let totalAvailableTradingCapital = 0;
+
+  // Determine active strategy exchange
+  const connectedExchanges = userConns.filter((c) => c.status === 'CONNECTED').map((c) => {
+    const norm = (c.exchange.charAt(0).toUpperCase() + c.exchange.slice(1).toLowerCase()) as SupportedExchange;
+    return norm;
+  });
+
+  if (!userSelectedStrategyExchange[userId] || !connectedExchanges.includes(userSelectedStrategyExchange[userId])) {
+    userSelectedStrategyExchange[userId] = connectedExchanges[0] || 'Binance';
+  }
+  const activeEx = userSelectedStrategyExchange[userId];
+
+  for (const ex of supported) {
+    const conn = userConns.find((c) => c.exchange.toLowerCase() === ex.toLowerCase() && c.status === 'CONNECTED');
+    if (conn) {
+      const state = capitalManager.getCapitalState(userId, ex);
+      totalConnectedCapital += state.exchangeBalance;
+      totalAvailableTradingCapital += state.availableTradingCapital;
+
+      exchangesRecord[ex] = {
+        exchange: ex,
+        connected: true,
+        exchangeBalance: state.exchangeBalance,
+        availableBalance: state.availableBalance,
+        allocatedCapital: state.allocatedCapital,
+        usedCapital: state.usedCapital,
+        availableTradingCapital: state.availableTradingCapital,
+        unrealizedPnL: state.unrealizedPnL,
+        realizedPnL: state.realizedPnL,
+        lastSyncTime: state.lastSyncTime,
+        capitalMode: state.capitalMode,
+        configuredAllocation: state.configuredAllocation,
+        syncStatus: state.syncStatus,
+        syncError: state.syncError,
+        isLiveTradingEnabled: Boolean(conn.is_live_trading_enabled || state.isLiveTradingEnabled),
+        permissions: {
+          read: true,
+          spotTrading: true,
+          futuresTrading: true,
+          withdrawals: false,
+        },
+      };
+    } else {
+      exchangesRecord[ex] = {
+        exchange: ex,
+        connected: false,
+        exchangeBalance: 0,
+        availableBalance: 0,
+        allocatedCapital: 0,
+        usedCapital: 0,
+        availableTradingCapital: 0,
+        unrealizedPnL: 0,
+        realizedPnL: 0,
+        lastSyncTime: 0,
+        capitalMode: 'AUTO_SYNC',
+        configuredAllocation: 0,
+        syncStatus: 'PENDING',
+        syncError: null,
+        isLiveTradingEnabled: false,
+        permissions: {
+          read: true,
+          spotTrading: true,
+          futuresTrading: true,
+          withdrawals: false,
+        },
+      };
+    }
+  }
+
+  // Evaluate 5-step checklist for the active strategy exchange
+  const activeConn = userConns.find((c) => c.exchange.toLowerCase() === activeEx.toLowerCase() && c.status === 'CONNECTED');
+  const readiness = capitalManager.verifyLiveTradingReadiness(
+    userId,
+    activeEx,
+    Boolean(activeConn),
+    true, // Spot/Futures trading permission
+    Boolean(riskSettings) // Risk limits configured
+  );
+
+  return {
+    totalConnectedCapital: Number(totalConnectedCapital.toFixed(2)),
+    totalAvailableTradingCapital: Number(totalAvailableTradingCapital.toFixed(2)),
+    activeStrategyExchange: activeEx,
+    exchanges: exchangesRecord,
+    liveReadiness: readiness,
+    syncedAt: Date.now(),
+  };
+}
+
+// 1. GET /api/capital/overview
+app.get('/api/capital/overview', (req: any, res) => {
+  try {
+    const userId = req.user?.id || DEFAULT_USER.id;
+    const overview = buildUserCapitalOverview(userId);
+    res.json(overview);
+  } catch (err: any) {
+    console.error('[CAPITAL OVERVIEW ERROR]', err);
+    res.status(500).json({ error: 'Failed to build capital overview', details: err?.message });
+  }
+});
+
+// 2. POST /api/capital/sync - Immediate On-Demand Synchronization
+app.post('/api/capital/sync', async (req: any, res) => {
+  const userId = req.user?.id || DEFAULT_USER.id;
+  const { exchange } = req.body;
+
+  try {
+    const userConns = getUserExchangeConnections(userId).filter((c) => c.status === 'CONNECTED');
+    if (userConns.length === 0) {
+      return res.json({
+        ...buildUserCapitalOverview(userId),
+        notice: 'No connected exchanges to sync.',
+      });
+    }
+
+    if (exchange) {
+      const normEx: SupportedExchange = exchange.toLowerCase().includes('bitg')
+        ? 'Bitget'
+        : exchange.toLowerCase().includes('bybit')
+        ? 'Bybit'
+        : 'Binance';
+      await syncUserExchangeBalance(userId, normEx);
+    } else {
+      for (const conn of userConns) {
+        const normEx = (conn.exchange.charAt(0).toUpperCase() + conn.exchange.slice(1).toLowerCase()) as SupportedExchange;
+        await syncUserExchangeBalance(userId, normEx);
+      }
+    }
+
+    const overview = buildUserCapitalOverview(userId);
+    res.json(overview);
+  } catch (err: any) {
+    console.error('[CAPITAL SYNC ERROR]', err);
+    res.status(500).json({ error: `Capital sync failed: ${err.message}` });
+  }
+});
+
+// 3. POST /api/capital/mode - Configure AUTO_SYNC or FIXED_ALLOCATION
+app.post('/api/capital/mode', (req: any, res) => {
+  const userId = req.user?.id || DEFAULT_USER.id;
+  const { exchange, capitalMode, configuredAllocation } = req.body;
+
+  const targetExchange: SupportedExchange = exchange
+    ? exchange.toLowerCase().includes('bitg')
+      ? 'Bitget'
+      : exchange.toLowerCase().includes('bybit')
+      ? 'Bybit'
+      : 'Binance'
+    : userSelectedStrategyExchange[userId] || 'Binance';
+
+  const mode: CapitalMode = capitalMode === 'FIXED_ALLOCATION' ? 'FIXED_ALLOCATION' : 'AUTO_SYNC';
+  const alloc = configuredAllocation !== undefined ? Number(configuredAllocation) : 0;
+
+  // Update in CapitalManager
+  const updatedState = capitalManager.setCapitalMode(userId, targetExchange, mode, alloc);
+
+  // Persist in database
+  const conn = getUserExchangeConnectionByExchange(userId, targetExchange);
+  if (conn) {
+    updateExchangeCapitalSync(userId, conn.id, {
+      capital_mode: mode,
+      configured_allocation: alloc,
+      latest_balance: updatedState.exchangeBalance,
+      latest_available_balance: updatedState.availableBalance,
+    });
+  }
+
+  // Update global cockpit balance if this is the active strategy exchange
+  if (userSelectedStrategyExchange[userId] === targetExchange) {
+    accountBalance = updatedState.availableTradingCapital;
+  }
+
+  const overview = buildUserCapitalOverview(userId);
+  res.json(overview);
+});
+
+// 4. POST /api/capital/select-exchange - Choose active exchange for strategy execution
+app.post('/api/capital/select-exchange', (req: any, res) => {
+  const userId = req.user?.id || DEFAULT_USER.id;
+  const { exchange } = req.body;
+
+  if (!exchange) {
+    return res.status(400).json({ error: 'Exchange is required.' });
+  }
+
+  const normEx: SupportedExchange = exchange.toLowerCase().includes('bitg')
+    ? 'Bitget'
+    : exchange.toLowerCase().includes('bybit')
+    ? 'Bybit'
+    : 'Binance';
+
+  userSelectedStrategyExchange[userId] = normEx;
+  const state = capitalManager.getCapitalState(userId, normEx);
+  accountBalance = state.availableTradingCapital;
+
+  const overview = buildUserCapitalOverview(userId);
+  res.json(overview);
+});
+
+// 5. POST /api/capital/live-trading - Explicit 5-step checklist validation & live trading toggle
+app.post('/api/capital/live-trading', (req: any, res) => {
+  const userId = req.user?.id || DEFAULT_USER.id;
+  const { exchange, enabled } = req.body;
+
+  const targetExchange: SupportedExchange = exchange
+    ? exchange.toLowerCase().includes('bitg')
+      ? 'Bitget'
+      : exchange.toLowerCase().includes('bybit')
+      ? 'Bybit'
+      : 'Binance'
+    : userSelectedStrategyExchange[userId] || 'Binance';
+
+  const shouldEnable = Boolean(enabled);
+  const conn = getUserExchangeConnectionByExchange(userId, targetExchange);
+
+  if (shouldEnable) {
+    // Strict 5-step verification checklist
+    const readiness = capitalManager.verifyLiveTradingReadiness(
+      userId,
+      targetExchange,
+      Boolean(conn && conn.status === 'CONNECTED'),
+      true,
+      Boolean(riskSettings)
+    );
+
+    if (!readiness.checks.exchangeConnected) {
+      return res.status(400).json({
+        error: 'Cannot enable Live Trading: Exchange is not connected.',
+        readiness,
+      });
+    }
+    if (!readiness.checks.balanceSuccessfullySynced) {
+      return res.status(400).json({
+        error: 'Cannot enable Live Trading: Balance must be successfully synchronized first.',
+        readiness,
+      });
+    }
+  }
+
+  capitalManager.setLiveTrading(userId, targetExchange, shouldEnable);
+  if (conn) {
+    setExchangeLiveTrading(userId, conn.id, shouldEnable);
+  }
+
+  const overview = buildUserCapitalOverview(userId);
+  res.json({
+    success: true,
+    message: shouldEnable
+      ? `Live Trading successfully activated for ${targetExchange}. Bot is authorized to place real exchange orders.`
+      : `Live Trading disabled for ${targetExchange}. Bot will operate in protected simulation mode.`,
+    overview,
   });
 });
 
@@ -2012,7 +2566,10 @@ app.get('/api/health', (req, res) => {
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: false,
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);

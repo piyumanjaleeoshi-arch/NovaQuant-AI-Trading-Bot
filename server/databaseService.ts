@@ -36,6 +36,14 @@ export interface ExchangeConnectionRecord {
   status: 'CONNECTED' | 'DISCONNECTED' | 'ERROR';
   created_at: number;
   updated_at: number;
+  capital_mode?: 'AUTO_SYNC' | 'FIXED_ALLOCATION';
+  configured_allocation?: number;
+  latest_balance?: number;
+  latest_available_balance?: number;
+  last_sync_time?: number;
+  sync_status?: 'SYNCED' | 'STALE' | 'ERROR' | 'PENDING';
+  sync_error?: string | null;
+  is_live_trading_enabled?: number; // 0 or 1
 }
 
 export interface BotRecord {
@@ -62,9 +70,32 @@ if (!fs.existsSync(DATA_DIR)) {
   }
 }
 
-const DB_FILE_PATH = process.env.DATABASE_URL
-  ? process.env.DATABASE_URL.replace('sqlite:///', '')
-  : path.join(process.cwd(), 'novaquant.db');
+function resolveDatabasePath(): string {
+  const raw = process.env.DATABASE_URL || '';
+  let clean = raw.trim().replace(/^['"]|['"]$/g, '');
+  if (clean.startsWith('sqlite:///')) {
+    clean = clean.replace('sqlite:///', '');
+  } else if (clean.startsWith('sqlite://')) {
+    clean = clean.replace('sqlite://', '');
+  } else if (clean.startsWith('sqlite:')) {
+    clean = clean.replace('sqlite:', '');
+  } else if (clean.startsWith('file:')) {
+    clean = clean.replace('file:', '');
+  }
+
+  const targetPath = clean ? path.resolve(process.cwd(), clean) : path.join(DATA_DIR, 'novaquant.db');
+  const targetDir = path.dirname(targetPath);
+  if (!fs.existsSync(targetDir)) {
+    try {
+      fs.mkdirSync(targetDir, { recursive: true });
+    } catch (err) {
+      console.error('[DATABASE] Error creating database directory:', err);
+    }
+  }
+  return targetPath;
+}
+
+const DB_FILE_PATH = resolveDatabasePath();
 
 const JSON_BACKUP_PATH = path.join(DATA_DIR, 'bot_state.json');
 const CONNECTIONS_BACKUP_PATH = path.join(DATA_DIR, 'exchange_connections.json');
@@ -77,7 +108,14 @@ try {
   sqliteDb = new DatabaseSync(DB_FILE_PATH);
   console.log(`[DATABASE] SQLite engine initialized successfully at ${DB_FILE_PATH}`);
 } catch (err: any) {
-  console.warn('[DATABASE] Native node:sqlite not available or failed to load, using durable JSON storage:', err?.message || err);
+  // If target path failed, try fallback path in DATA_DIR
+  try {
+    const fallbackPath = path.join(DATA_DIR, 'novaquant.db');
+    sqliteDb = new DatabaseSync(fallbackPath);
+    console.log(`[DATABASE] SQLite engine initialized using fallback at ${fallbackPath}`);
+  } catch (fallbackErr: any) {
+    console.warn('[DATABASE] Native node:sqlite not available or failed to load, using durable JSON storage:', err?.message || err);
+  }
 }
 
 // Initialize tables
@@ -166,6 +204,35 @@ export function initDatabase(): {
       }
       if (!colNames.has('metadata')) {
         sqliteDb.exec('ALTER TABLE bot_status ADD COLUMN metadata TEXT;');
+      }
+
+      // Ensure capital sync columns exist in exchange_connections
+      const connTableInfo = sqliteDb.prepare("PRAGMA table_info(exchange_connections)").all() as Array<{ name: string }>;
+      const connColNames = new Set(connTableInfo.map((c) => c.name));
+
+      if (!connColNames.has('capital_mode')) {
+        sqliteDb.exec("ALTER TABLE exchange_connections ADD COLUMN capital_mode TEXT NOT NULL DEFAULT 'AUTO_SYNC';");
+      }
+      if (!connColNames.has('configured_allocation')) {
+        sqliteDb.exec("ALTER TABLE exchange_connections ADD COLUMN configured_allocation REAL NOT NULL DEFAULT 0;");
+      }
+      if (!connColNames.has('latest_balance')) {
+        sqliteDb.exec("ALTER TABLE exchange_connections ADD COLUMN latest_balance REAL NOT NULL DEFAULT 0;");
+      }
+      if (!connColNames.has('latest_available_balance')) {
+        sqliteDb.exec("ALTER TABLE exchange_connections ADD COLUMN latest_available_balance REAL NOT NULL DEFAULT 0;");
+      }
+      if (!connColNames.has('last_sync_time')) {
+        sqliteDb.exec("ALTER TABLE exchange_connections ADD COLUMN last_sync_time INTEGER NOT NULL DEFAULT 0;");
+      }
+      if (!connColNames.has('sync_status')) {
+        sqliteDb.exec("ALTER TABLE exchange_connections ADD COLUMN sync_status TEXT NOT NULL DEFAULT 'PENDING';");
+      }
+      if (!connColNames.has('sync_error')) {
+        sqliteDb.exec("ALTER TABLE exchange_connections ADD COLUMN sync_error TEXT;");
+      }
+      if (!connColNames.has('is_live_trading_enabled')) {
+        sqliteDb.exec("ALTER TABLE exchange_connections ADD COLUMN is_live_trading_enabled INTEGER NOT NULL DEFAULT 0;");
       }
 
       console.log('[DATABASE] Tables verified and migrated: bot_status, bot_audit_logs, risk_settings, exchange_connections, bots');
@@ -639,6 +706,112 @@ export function updateUserExchangeConnectionStatus(
   return false;
 }
 
+/**
+ * Updates capital sync fields for a connection.
+ */
+export function updateExchangeCapitalSync(
+  userId: string,
+  connectionId: string,
+  data: {
+    latest_balance?: number;
+    latest_available_balance?: number;
+    last_sync_time?: number;
+    sync_status?: 'SYNCED' | 'STALE' | 'ERROR' | 'PENDING';
+    sync_error?: string | null;
+    capital_mode?: 'AUTO_SYNC' | 'FIXED_ALLOCATION';
+    configured_allocation?: number;
+  }
+): boolean {
+  const now = Date.now();
+  if (sqliteDb) {
+    try {
+      const updates: string[] = ['updated_at = ?'];
+      const values: any[] = [now];
+
+      if (data.latest_balance !== undefined) {
+        updates.push('latest_balance = ?');
+        values.push(data.latest_balance);
+      }
+      if (data.latest_available_balance !== undefined) {
+        updates.push('latest_available_balance = ?');
+        values.push(data.latest_available_balance);
+      }
+      if (data.last_sync_time !== undefined) {
+        updates.push('last_sync_time = ?');
+        values.push(data.last_sync_time);
+      }
+      if (data.sync_status !== undefined) {
+        updates.push('sync_status = ?');
+        values.push(data.sync_status);
+      }
+      if (data.sync_error !== undefined) {
+        updates.push('sync_error = ?');
+        values.push(data.sync_error);
+      }
+      if (data.capital_mode !== undefined) {
+        updates.push('capital_mode = ?');
+        values.push(data.capital_mode);
+      }
+      if (data.configured_allocation !== undefined) {
+        updates.push('configured_allocation = ?');
+        values.push(data.configured_allocation);
+      }
+
+      values.push(connectionId, userId);
+      const query = `UPDATE exchange_connections SET ${updates.join(', ')} WHERE id = ? AND user_id = ?`;
+      sqliteDb.prepare(query).run(...values);
+    } catch (err) {
+      console.error('[DATABASE ERROR] Failed updating exchange capital sync:', err);
+    }
+  }
+
+  const allConns = readConnectionsBackup();
+  const conn = allConns.find((c) => c.id === connectionId && c.user_id === userId);
+  if (conn) {
+    if (data.latest_balance !== undefined) conn.latest_balance = data.latest_balance;
+    if (data.latest_available_balance !== undefined) conn.latest_available_balance = data.latest_available_balance;
+    if (data.last_sync_time !== undefined) conn.last_sync_time = data.last_sync_time;
+    if (data.sync_status !== undefined) conn.sync_status = data.sync_status;
+    if (data.sync_error !== undefined) conn.sync_error = data.sync_error;
+    if (data.capital_mode !== undefined) conn.capital_mode = data.capital_mode;
+    if (data.configured_allocation !== undefined) conn.configured_allocation = data.configured_allocation;
+    conn.updated_at = now;
+    writeConnectionsBackup(allConns);
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Updates live trading permission flag for a connection.
+ */
+export function setExchangeLiveTrading(
+  userId: string,
+  connectionId: string,
+  enabled: boolean
+): boolean {
+  const now = Date.now();
+  const flag = enabled ? 1 : 0;
+  if (sqliteDb) {
+    try {
+      const stmt = sqliteDb.prepare('UPDATE exchange_connections SET is_live_trading_enabled = ?, updated_at = ? WHERE id = ? AND user_id = ?');
+      stmt.run(flag, now, connectionId, userId);
+    } catch (err) {
+      console.error('[DATABASE ERROR] Failed setting exchange live trading status:', err);
+    }
+  }
+
+  const allConns = readConnectionsBackup();
+  const conn = allConns.find((c) => c.id === connectionId && c.user_id === userId);
+  if (conn) {
+    conn.is_live_trading_enabled = flag;
+    conn.updated_at = now;
+    writeConnectionsBackup(allConns);
+    return true;
+  }
+  return false;
+}
+
 /* =========================================================================
    MULTI-USER BOTS CRUD OPERATIONS
    ========================================================================= */
@@ -777,6 +950,51 @@ export function getUserBotById(userId: string, botId: string): BotRecord | null 
   }
   const match = readBotsBackup().find((b) => b.id === botId && b.user_id === userId);
   return match || null;
+}
+
+/**
+ * Updates a user bot with ownership check.
+ */
+export function updateUserBot(
+  userId: string,
+  botId: string,
+  updates: Partial<Omit<BotRecord, 'id' | 'user_id' | 'created_at'>>
+): BotRecord | null {
+  const now = Date.now();
+  if (sqliteDb) {
+    try {
+      const current = getUserBotById(userId, botId);
+      if (!current) return null;
+      const updated = { ...current, ...updates, updated_at: now };
+      const stmt = sqliteDb.prepare(`
+        UPDATE bots
+        SET name = ?, strategy = ?, trading_pair = ?, capital_allocation = ?, risk_settings = ?, status = ?, updated_at = ?
+        WHERE id = ? AND user_id = ?
+      `);
+      stmt.run(
+        updated.name,
+        updated.strategy,
+        updated.trading_pair,
+        updated.capital_allocation,
+        typeof updated.risk_settings === 'string' ? updated.risk_settings : JSON.stringify(updated.risk_settings),
+        updated.status,
+        now,
+        botId,
+        userId
+      );
+    } catch (err) {
+      console.error('[DATABASE ERROR] Failed updating bot in SQLite:', err);
+    }
+  }
+
+  const allBots = readBotsBackup();
+  const idx = allBots.findIndex((b) => b.id === botId && b.user_id === userId);
+  if (idx >= 0) {
+    allBots[idx] = { ...allBots[idx], ...updates, updated_at: now };
+    writeBotsBackup(allBots);
+    return allBots[idx];
+  }
+  return null;
 }
 
 /**

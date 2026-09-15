@@ -260,3 +260,70 @@ export interface AllExchangeBalancesResponse {
   syncedAt: number;
 }
 
+export type CapitalMode = 'AUTO_SYNC' | 'FIXED_ALLOCATION';
+export type SyncStatus = 'SYNCED' | 'STALE' | 'ERROR' | 'PENDING';
+
+export interface CapitalManagerInfo {
+  exchange: SupportedExchange;
+  connected: boolean;
+  exchangeBalance: number;       // USDT Balance on Exchange
+  availableBalance: number;      // Available USDT on Exchange
+  allocatedCapital: number;      // Capital allocated to bot
+  usedCapital: number;           // Capital currently used in trades
+  availableTradingCapital: number;// Liquid capital available for bot orders
+  unrealizedPnL: number;
+  realizedPnL: number;
+  lastSyncTime: number;
+  capitalMode: CapitalMode;
+  configuredAllocation: number;
+  syncStatus: SyncStatus;
+  syncError: string | null;
+  isLiveTradingEnabled: boolean;
+  permissions?: {
+    read: boolean;
+    spotTrading: boolean;
+    futuresTrading: boolean;
+    withdrawals: boolean;
+  };
+}
+
+export interface CapitalOverviewResponse {
+  totalConnectedCapital: number;
+  totalAvailableTradingCapital: number;
+  activeStrategyExchange: SupportedExchange | null;
+  exchanges: Record<SupportedExchange, CapitalManagerInfo>;
+  liveReadiness: {
+    isReady: boolean;
+    checks: {
+      exchangeConnected: boolean;
+      balanceSuccessfullySynced: boolean;
+      tradingPermissionEnabled: boolean;
+      riskLimitsConfigured: boolean;
+      userExplicitlyEnabledLiveTrading: boolean;
+    };
+    missingRequirements: string[];
+  };
+  syncedAt: number;
+}
+
+export interface UserProfile {
+  id: string;
+  email: string;
+  name: string;
+}
+
+export interface ConnectionTestResult {
+  success: boolean;
+  exchange: SupportedExchange;
+  status: 'CONNECTED' | 'DISCONNECTED' | 'ERROR';
+  latencyMs: number;
+  permissions: {
+    read: boolean;
+    trade: boolean;
+    withdrawal: boolean;
+  };
+  message?: string;
+  error?: string;
+}
+
+

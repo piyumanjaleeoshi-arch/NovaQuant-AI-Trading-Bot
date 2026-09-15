@@ -12,7 +12,6 @@ import {
   RefreshCw,
   Eye,
   EyeOff,
-  Server,
   Activity,
   Globe,
   Trash2,
@@ -22,14 +21,20 @@ import {
   ArrowRight,
   ExternalLink
 } from 'lucide-react';
-import { SupportedExchange, ExchangeConnectionInfo, AllExchangeBalancesResponse } from '../types';
+import {
+  SupportedExchange,
+  ExchangeConnectionInfo,
+  AllExchangeBalancesResponse,
+  ConnectionTestResult
+} from '../types';
 import { NavTab } from '../components/Sidebar';
 import {
   fetchExchangeConnections,
   connectExchange,
   disconnectExchange,
   fetchExchangeBalances,
-  refreshExchangeBalances
+  refreshExchangeBalances,
+  testExchangeConnection
 } from '../services/api';
 
 interface APIConnectPageProps {
@@ -44,6 +49,8 @@ export const APIConnectPage: React.FC<APIConnectPageProps> = ({ onShowToast, onN
   const [passphrase, setPassphrase] = useState('');
   const [showSecret, setShowSecret] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
+  const [isTesting, setIsTesting] = useState(false);
+  const [testResult, setTestResult] = useState<ConnectionTestResult | null>(null);
   const [isRefreshingBalances, setIsRefreshingBalances] = useState(false);
   const [balanceData, setBalanceData] = useState<AllExchangeBalancesResponse | null>(null);
   const [copiedIPs, setCopiedIPs] = useState(false);
@@ -86,7 +93,7 @@ export const APIConnectPage: React.FC<APIConnectPageProps> = ({ onShowToast, onN
 
   const ipString = trustedIPs.join(', ');
 
-  // Load existing connections from backend
+  // Load existing connections strictly from server (no local credential storage)
   const loadConnections = async () => {
     try {
       const data = await fetchExchangeConnections();
@@ -97,16 +104,7 @@ export const APIConnectPage: React.FC<APIConnectPageProps> = ({ onShowToast, onN
         setTrustedIPs(data.trustedIPs);
       }
     } catch (err) {
-      // Fallback local check
-      const saved = localStorage.getItem('novaquant_exchange_keys');
-      if (saved) {
-        try {
-          const parsed = JSON.parse(saved);
-          setConnections((prev) => ({ ...prev, ...parsed }));
-        } catch {
-          // ignore
-        }
-      }
+      console.warn('Could not fetch exchange connections from server:', err);
     }
 
     // Also fetch real balances from server
@@ -121,6 +119,62 @@ export const APIConnectPage: React.FC<APIConnectPageProps> = ({ onShowToast, onN
   useEffect(() => {
     loadConnections();
   }, []);
+
+  const handleTestConnection = async () => {
+    if (!apiKey.trim() || !secretKey.trim()) {
+      if (onShowToast) {
+        onShowToast('Please provide both API Key and Secret Key to test connection.', 'error');
+      }
+      return;
+    }
+
+    if (selectedExchange === 'Bitget' && !passphrase.trim()) {
+      if (onShowToast) {
+        onShowToast('Bitget requires an API passphrase.', 'error');
+      }
+      return;
+    }
+
+    setIsTesting(true);
+    setTestResult(null);
+    try {
+      const res = await testExchangeConnection({
+        exchange: selectedExchange,
+        apiKey: apiKey.trim(),
+        secretKey: secretKey.trim(),
+        passphrase: passphrase.trim() || undefined,
+      });
+
+      setTestResult(res);
+      if (res.success) {
+        if (onShowToast) {
+          onShowToast(
+            `Connection test passed (${res.latencyMs}ms)! Read & trade permissions verified. Withdrawals disabled.`,
+            'success'
+          );
+        }
+      } else {
+        if (onShowToast) {
+          onShowToast(res.error || 'Connection test failed.', 'error');
+        }
+      }
+    } catch (err: any) {
+      const failureResult: ConnectionTestResult = {
+        success: false,
+        exchange: selectedExchange,
+        status: 'ERROR',
+        latencyMs: 0,
+        permissions: { read: false, trade: false, withdrawal: false },
+        error: err.message || 'Connection test failed',
+      };
+      setTestResult(failureResult);
+      if (onShowToast) {
+        onShowToast(err.message || 'Connection test failed.', 'error');
+      }
+    } finally {
+      setIsTesting(false);
+    }
+  };
 
   const handleRefreshBalances = async () => {
     try {
@@ -175,6 +229,13 @@ export const APIConnectPage: React.FC<APIConnectPageProps> = ({ onShowToast, onN
       return;
     }
 
+    if (selectedExchange === 'Bitget' && !passphrase.trim()) {
+      if (onShowToast) {
+        onShowToast('Bitget requires an API passphrase.', 'error');
+      }
+      return;
+    }
+
     setIsConnecting(true);
     try {
       const res = await connectExchange({
@@ -186,28 +247,26 @@ export const APIConnectPage: React.FC<APIConnectPageProps> = ({ onShowToast, onN
         selectedMode: 'SPOT',
       });
 
-      // Update connection state
+      // Update connection state from server response
       const masked = `${apiKey.trim().slice(0, 4)}••••••••${apiKey.trim().slice(-4)}`;
-      setConnections((prev) => {
-        const updated = {
-          ...prev,
-          [selectedExchange]: {
-            ...prev[selectedExchange],
-            status: 'CONNECTED' as const,
-            apiKeyMasked: masked,
-            hasSecret: true,
-            hasPassphrase: !!passphrase.trim(),
-            connectedAt: Date.now(),
-            pingMs: res.pingMs || 22,
+      setConnections((prev) => ({
+        ...prev,
+        [selectedExchange]: {
+          ...prev[selectedExchange],
+          status: 'CONNECTED' as const,
+          apiKeyMasked: masked,
+          hasSecret: true,
+          hasPassphrase: !!passphrase.trim(),
+          connectedAt: Date.now(),
+          pingMs: res.pingMs || 22,
+          permissions: res.permissions || {
+            read: true,
+            spotTrading: true,
+            futuresTrading: true,
+            withdrawals: false,
           },
-        };
-        try {
-          localStorage.setItem('novaquant_exchange_keys', JSON.stringify(updated));
-        } catch {
-          // ignore
-        }
-        return updated;
-      });
+        },
+      }));
 
       // Update balances state
       if (res.balance) {
@@ -231,17 +290,18 @@ export const APIConnectPage: React.FC<APIConnectPageProps> = ({ onShowToast, onN
       setApiKey('');
       setSecretKey('');
       setPassphrase('');
+      setTestResult(null);
 
       if (onShowToast) {
         const botCap = res.botCapital !== undefined ? `${res.botCapital.toFixed(2)} USDT` : 'Available Balance';
         onShowToast(
-          `${selectedExchange} connected! Bot Capital automatically synchronized to ${botCap}.`,
+          `${selectedExchange} securely connected & encrypted! Bot Capital synchronized to ${botCap}.`,
           'success'
         );
       }
     } catch (err: any) {
       if (onShowToast) {
-        onShowToast(err?.message || 'Failed to import API keys. Please verify credentials.', 'error');
+        onShowToast(err?.message || 'Failed to connect exchange. Please verify credentials.', 'error');
       }
     } finally {
       setIsConnecting(false);
@@ -251,23 +311,17 @@ export const APIConnectPage: React.FC<APIConnectPageProps> = ({ onShowToast, onN
   const handleDisconnect = async (ex: SupportedExchange) => {
     try {
       await disconnectExchange(ex);
-      setConnections((prev) => {
-        const updated = {
-          ...prev,
-          [ex]: {
-            ...prev[ex],
-            status: 'DISCONNECTED' as const,
-            apiKeyMasked: '',
-            hasSecret: false,
-          },
-        };
-        try {
-          localStorage.setItem('novaquant_exchange_keys', JSON.stringify(updated));
-        } catch {
-          // ignore
-        }
-        return updated;
-      });
+      setConnections((prev) => ({
+        ...prev,
+        [ex]: {
+          ...prev[ex],
+          status: 'DISCONNECTED' as const,
+          apiKeyMasked: '',
+          hasSecret: false,
+        },
+      }));
+      setTestResult(null);
+      await loadConnections();
       if (onShowToast) onShowToast(`${ex} disconnected.`, 'info');
     } catch {
       if (onShowToast) onShowToast('Error disconnecting exchange.', 'error');
@@ -298,10 +352,14 @@ export const APIConnectPage: React.FC<APIConnectPageProps> = ({ onShowToast, onN
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
-            <span className="flex items-center gap-1.5 rounded-full border border-[#bf9b42]/40 bg-[#bf9b42]/15 px-3 py-1 text-xs font-semibold text-[#f5e6b3]">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="flex items-center gap-1.5 rounded-full border border-emerald-500/40 bg-emerald-500/15 px-3 py-1 text-xs font-semibold text-emerald-300">
               <ShieldCheck className="h-3.5 w-3.5 text-emerald-400" />
-              <span>E2E Encrypted Gateway</span>
+              <span>Zero-Withdrawal Policy Enforced</span>
+            </span>
+            <span className="flex items-center gap-1.5 rounded-full border border-[#bf9b42]/40 bg-[#bf9b42]/15 px-3 py-1 text-xs font-semibold text-[#f5e6b3]">
+              <Lock className="h-3.5 w-3.5 text-[#bf9b42]" />
+              <span>AES-256-GCM Encrypted</span>
             </span>
           </div>
         </div>
@@ -540,27 +598,141 @@ export const APIConnectPage: React.FC<APIConnectPageProps> = ({ onShowToast, onN
                 </div>
               )}
 
-              {/* Actions Row: Import Button */}
-              <div className="pt-2">
+              {/* Actions Row: Test Connection & Import Buttons */}
+              <div className="pt-2 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <button
+                  id="test-api-btn"
+                  type="button"
+                  onClick={handleTestConnection}
+                  disabled={isTesting || isConnecting}
+                  className="rounded-xl border border-[#bf9b42]/60 bg-[#033631] px-4 py-2.5 text-xs font-bold text-[#f5e6b3] hover:bg-[#bf9b42]/20 active:scale-[0.99] disabled:opacity-50 transition-all flex items-center justify-center gap-2 cursor-pointer"
+                >
+                  {isTesting ? (
+                    <>
+                      <RefreshCw className="h-4 w-4 animate-spin text-[#bf9b42]" />
+                      <span>Testing Handshake...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Activity className="h-4 w-4 text-[#bf9b42]" />
+                      <span>Test Connection</span>
+                    </>
+                  )}
+                </button>
+
                 <button
                   id="import-api-btn"
                   type="submit"
-                  disabled={isConnecting}
-                  className="w-full rounded-xl bg-gradient-to-r from-[#bf9b42] to-[#9c7c2b] px-5 py-2.5 text-xs font-bold text-[#033631] shadow-lg shadow-[#bf9b42]/20 hover:brightness-110 active:scale-[0.99] disabled:opacity-50 transition-all flex items-center justify-center gap-2 cursor-pointer"
+                  disabled={isConnecting || isTesting}
+                  className="rounded-xl bg-gradient-to-r from-[#bf9b42] to-[#9c7c2b] px-4 py-2.5 text-xs font-bold text-[#033631] shadow-lg shadow-[#bf9b42]/20 hover:brightness-110 active:scale-[0.99] disabled:opacity-50 transition-all flex items-center justify-center gap-2 cursor-pointer"
                 >
                   {isConnecting ? (
                     <>
                       <RefreshCw className="h-4 w-4 animate-spin text-[#033631]" />
-                      <span>Validating &amp; Importing...</span>
+                      <span>Validating &amp; Encrypting...</span>
                     </>
                   ) : (
                     <>
                       <UploadCloud className="h-4 w-4 text-[#033631]" />
-                      <span>Import Button (Connect {selectedExchange})</span>
+                      <span>Import &amp; Save ({selectedExchange})</span>
                     </>
                   )}
                 </button>
               </div>
+
+              {/* Connection Test Result Inspection Panel */}
+              {testResult && (
+                <div
+                  className={`rounded-xl border p-4 text-xs space-y-3 transition-all ${
+                    testResult.success
+                      ? 'border-emerald-500/50 bg-emerald-950/20 text-emerald-200'
+                      : 'border-rose-500/50 bg-rose-950/20 text-rose-200'
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      {testResult.success ? (
+                        <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" />
+                      ) : (
+                        <AlertTriangle className="h-4 w-4 text-rose-400 shrink-0" />
+                      )}
+                      <span className="font-bold">
+                        {testResult.success
+                          ? `${testResult.exchange} Gateway Handshake Passed (${testResult.latencyMs}ms)`
+                          : `${testResult.exchange} Connection Failed`}
+                      </span>
+                    </div>
+                    <span
+                      className={`text-[10px] font-bold px-2 py-0.5 rounded uppercase tracking-wider ${
+                        testResult.success
+                          ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                          : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
+                      }`}
+                    >
+                      {testResult.status}
+                    </span>
+                  </div>
+
+                  {testResult.error && (
+                    <p className="text-[11px] text-rose-300 bg-rose-900/30 p-2 rounded-lg border border-rose-800/40">
+                      {testResult.error}
+                    </p>
+                  )}
+
+                  {/* Permissions Checklist */}
+                  <div className="grid grid-cols-3 gap-2 pt-1">
+                    <div className="rounded-lg bg-[#021f1c] p-2 border border-[#bf9b42]/20">
+                      <div className="text-[10px] text-[#bf9b42]">Read Account:</div>
+                      <div className="font-semibold text-[11px] text-white flex items-center gap-1 mt-0.5">
+                        {testResult.permissions.read ? (
+                          <Check className="h-3 w-3 text-emerald-400" />
+                        ) : (
+                          <span className="text-rose-400">✗</span>
+                        )}
+                        <span>{testResult.permissions.read ? 'Verified' : 'Disabled'}</span>
+                      </div>
+                    </div>
+
+                    <div className="rounded-lg bg-[#021f1c] p-2 border border-[#bf9b42]/20">
+                      <div className="text-[10px] text-[#bf9b42]">Trading:</div>
+                      <div className="font-semibold text-[11px] text-white flex items-center gap-1 mt-0.5">
+                        {testResult.permissions.trade ? (
+                          <Check className="h-3 w-3 text-emerald-400" />
+                        ) : (
+                          <span className="text-rose-400">✗</span>
+                        )}
+                        <span>{testResult.permissions.trade ? 'Verified' : 'Disabled'}</span>
+                      </div>
+                    </div>
+
+                    <div className="rounded-lg bg-[#021f1c] p-2 border border-[#bf9b42]/20">
+                      <div className="text-[10px] text-[#bf9b42]">Withdrawals:</div>
+                      <div className="font-semibold text-[11px] mt-0.5 flex items-center gap-1">
+                        {testResult.permissions.withdrawal ? (
+                          <span className="text-rose-400 flex items-center gap-1">
+                            <AlertTriangle className="h-3 w-3 text-rose-400" />
+                            <span>ALLOWED (Unsafe)</span>
+                          </span>
+                        ) : (
+                          <span className="text-emerald-400 flex items-center gap-1">
+                            <Check className="h-3 w-3 text-emerald-400" />
+                            <span>Disabled (Safe)</span>
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {testResult.permissions.withdrawal && (
+                    <div className="text-[11px] text-rose-300 font-semibold flex items-center gap-1.5 bg-rose-900/40 p-2 rounded-lg">
+                      <AlertTriangle className="h-4 w-4 shrink-0 text-rose-400" />
+                      <span>
+                        Security Policy Violation: Withdrawals are enabled. NovaQuant strictly rejects any API key with withdrawal permissions enabled. Please disable withdrawals on {selectedExchange} and re-test.
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )}
             </form>
 
             {/* If currently connected, show disconnect option */}
